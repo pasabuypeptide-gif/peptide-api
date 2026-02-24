@@ -6,16 +6,22 @@ require('dotenv').config();
 const app = express();
 app.use(cors());
 app.use(express.json());
-app.get('/', (req, res) => {
-  res.json({ message: 'Peptide API is running!', status: 'ok' });
-});
+
 // Database connection
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-// Test database connection
+// CONFIG (from your Code.gs)
+const CONFIG = {
+  BATCH_SIZE: 10,
+  PAYMENT_DEADLINE_HOURS: 24
+};
+
+// ==================== HELPER FUNCTIONS ====================
+
+// Test connection
 app.get('/test', async (req, res) => {
   try {
     const result = await pool.query('SELECT NOW()');
@@ -24,6 +30,8 @@ app.get('/test', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// ==================== PRODUCTS ====================
 
 // Get all products
 app.get('/products', async (req, res) => {
@@ -35,22 +43,98 @@ app.get('/products', async (req, res) => {
   }
 });
 
+// Add product
+app.post('/products', async (req, res) => {
+  const { name, code, price, type, description, mg_per_ml, category } = req.body;
+  try {
+    const result = await pool.query(
+      'INSERT INTO products (name, code, price, type, description, mg_per_ml, category) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
+      [name, code, price, type || 'vial', description, mg_per_ml, category]
+    );
+    res.json({ success: true, product: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update product
+app.patch('/products/:id', async (req, res) => {
+  const { name, price, active } = req.body;
+  try {
+    const updates = [];
+    const values = [];
+    let idx = 1;
+    
+    if (name) { updates.push(`name = $${idx++}`); values.push(name); }
+    if (price) { updates.push(`price = $${idx++}`); values.push(price); }
+    if (active !== undefined) { updates.push(`active = $${idx++}`); values.push(active); }
+    
+    values.push(req.params.id);
+    const query = `UPDATE products SET ${updates.join(', ')} WHERE id = $${idx} RETURNING *`;
+    
+    const result = await pool.query(query, values);
+    res.json({ success: true, product: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==================== ORDERS ====================
+
+// Get all orders with items
+app.get('/orders', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT o.*, 
+        COALESCE(json_agg(
+          json_build_object(
+            'product_code', oi.product_code,
+            'product_name', oi.product_name,
+            'quantity', oi.quantity,
+            'price_each', oi.price_each,
+            'subtotal', oi.subtotal,
+            'type', p.type
+          )
+        ) FILTER (WHERE oi.id IS NOT NULL), '[]') as items
+      FROM orders o
+      LEFT JOIN order_items oi ON o.id = oi.order_id
+      LEFT JOIN products p ON oi.product_code = p.code
+      GROUP BY o.id
+      ORDER BY o.created_at DESC
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Create new order
 app.post('/orders', async (req, res) => {
-  const { customer_name, facebook_name, customer_email, customer_phone, delivery_address, items, total, notes } = req.body;
+  const { customer_name, facebook_name, customer_email, customer_phone, delivery_address, items, notes } = req.body;
   
   try {
-    // Generate order number (ORD-YYYYMMDD-001)
+    // Calculate totals
+    let subtotal = 0;
+    const hasBoxes = items.some(item => item.type === 'box');
+    const pasabuyFee = hasBoxes ? 600 : 0;
+    
+    items.forEach(item => {
+      subtotal += item.price * item.qty;
+    });
+    
+    const totalAmount = subtotal + pasabuyFee;
+    
+    // Generate order number
     const date = new Date().toISOString().slice(0,10).replace(/-/g,'');
     const count = await pool.query('SELECT COUNT(*) FROM orders WHERE DATE(created_at) = CURRENT_DATE');
     const orderNum = `ORD-${date}-${String(parseInt(count.rows[0].count) + 1).padStart(3, '0')}`;
     
     // Insert order
     const orderResult = await pool.query(
-      `INSERT INTO orders (order_number, customer_name, facebook_name, customer_email, customer_phone, delivery_address, total_amount, notes) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) 
+      `INSERT INTO orders (order_number, customer_name, facebook_name, customer_email, customer_phone, delivery_address, subtotal, pasabuy_fee, total_amount, notes, status) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending') 
        RETURNING *`,
-      [orderNum, customer_name, facebook_name, customer_email, customer_phone, delivery_address, total, notes]
+      [orderNum, customer_name, facebook_name, customer_email, customer_phone, delivery_address, subtotal, pasabuyFee, totalAmount, notes]
     );
     
     const orderId = orderResult.rows[0].id;
@@ -71,126 +155,53 @@ app.post('/orders', async (req, res) => {
   }
 });
 
-// Get all orders (for admin)
-app.get('/orders', async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT o.*, 
-        COALESCE(json_agg(
-          json_build_object(
-            'product_code', oi.product_code,
-            'product_name', oi.product_name,
-            'quantity', oi.quantity,
-            'price_each', oi.price_each,
-            'subtotal', oi.subtotal
-          )
-        ) FILTER (WHERE oi.id IS NOT NULL), '[]') as items
-      FROM orders o
-      LEFT JOIN order_items oi ON o.id = oi.order_id
-      GROUP BY o.id
-      ORDER BY o.created_at DESC
-    `);
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Get overdue orders (unpaid > 24 hours)
-app.get('/orders/overdue', async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT * FROM orders 
-      WHERE status = 'pending' 
-      AND created_at < NOW() - INTERVAL '24 hours'
-      ORDER BY created_at ASC
-    `);
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Update order status (mark as paid)
-app.patch('/orders/:id/pay', async (req, res) => {
+// Update order
+app.patch('/orders/:id', async (req, res) => {
+  const { customer_name, facebook_name, customer_email, customer_phone, delivery_address, status, notes } = req.body;
+  
   try {
     const result = await pool.query(
-      "UPDATE orders SET status = 'paid', paid_at = NOW() WHERE id = $1 RETURNING *",
-      [req.params.id]
+      `UPDATE orders 
+       SET customer_name = $1, facebook_name = $2, customer_email = $3, 
+           customer_phone = $4, delivery_address = $5, status = $6, notes = $7, updated_at = NOW()
+       WHERE id = $8 RETURNING *`,
+      [customer_name, facebook_name, customer_email, customer_phone, delivery_address, status, notes, req.params.id]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' });
-    res.json(result.rows[0]);
+    
+    res.json({ success: true, order: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Get batches info
-app.get('/batches', async (req, res) => {
+// Record payment
+app.post('/orders/:id/pay', async (req, res) => {
+  const { amount, method, notes } = req.body;
+  
   try {
-    // Get all products with their order counts
-    const products = await pool.query('SELECT * FROM products WHERE active = true');
-    const batchSize = 10; // Your batch size
+    // Get current order
+    const order = await pool.query('SELECT * FROM orders WHERE id = $1', [req.params.id]);
+    if (order.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
     
-    const batchData = {};
+    const currentOrder = order.rows[0];
+    const newPaid = (parseFloat(currentOrder.paid_amount) || 0) + parseFloat(amount);
+    const total = parseFloat(currentOrder.total_amount);
+    const remaining = Math.max(0, total - newPaid);
+    const status = remaining <= 0.01 ? 'paid' : 'partial';
     
-    for (const product of products.rows) {
-      const count = await pool.query(`
-        SELECT COALESCE(SUM(oi.quantity), 0) as filled
-        FROM order_items oi
-        JOIN orders o ON oi.order_id = o.id
-        WHERE oi.product_code = $1 AND o.status != 'cancelled'
-      `, [product.code]);
-      
-      const filled = parseInt(count.rows[0].filled) || 0;
-      const currentBatch = Math.floor(filled / batchSize) + 1;
-      const filledInCurrent = filled % batchSize;
-      
-      batchData[product.code] = {
-        product: product,
-        currentBatch: currentBatch,
-        filled: filledInCurrent,
-        totalFilled: filled,
-        remaining: batchSize - filledInCurrent
-      };
-    }
+    // Update order
+    const result = await pool.query(
+      `UPDATE orders 
+       SET paid_amount = $1, remaining_amount = $2, status = $3, paid_at = CASE WHEN $3 = 'paid' THEN NOW() ELSE paid_at END
+       WHERE id = $4 RETURNING *`,
+      [newPaid, remaining, status, req.params.id]
+    );
     
-    res.json({ batchSize, batches: batchData });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Reviews endpoints
-app.get('/reviews', async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT r.*, p.name as product_name
-      FROM reviews r
-      LEFT JOIN products p ON r.product_id = p.id
-      WHERE r.approved = true
-      ORDER BY r.created_at DESC
-      LIMIT 20
-    `);
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/reviews', async (req, res) => {
-  const { customer_name, rating, comment, product_code } = req.body;
-  try {
+    // Record payment
     await pool.query(
-      `INSERT INTO reviews (customer_name, rating, comment, product_id) 
-       VALUES ($1, $2, $3, (SELECT id FROM products WHERE code = $4))`,
-      [customer_name, rating, comment, product_code]
+      `INSERT INTO payments (order_id, amount, method, notes) VALUES ($1, $2, $3, $4)`,
+      [req.params.id, amount, method || 'manual', notes]
     );
-    res.json({ success: true });
+    
+    res.json({ success: true, order: result.rows[0], payment: { amount, method, status } });
   } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
