@@ -6,7 +6,9 @@ require('dotenv').config();
 const app = express();
 app.use(cors());
 app.use(express.json());
-
+app.get('/', (req, res) => {
+  res.json({ message: 'Peptide API is running!', status: 'ok' });
+});
 // Database connection
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
